@@ -165,40 +165,6 @@ class _ProfileTabState extends State<ProfileTab> {
                     ),
                   ),
                 ),
-                const Divider(height: 1),
-                ListTile(
-                  leading: const Icon(Icons.refresh),
-                  title: Text(l.rebuildIndex),
-                  subtitle: Text(l.rebuildIndexHint),
-                  onTap: () async {
-                    final ok = await showDialog<bool>(
-                      context: context,
-                      builder: (ctx) {
-                        return AlertDialog(
-                          title: Text(l.rebuildTitle),
-                          content: Text(l.rebuildBody),
-                          actions: [
-                            TextButton(
-                              onPressed: () => Navigator.of(ctx).pop(false),
-                              child: Text(l.cancel),
-                            ),
-                            FilledButton(
-                              onPressed: () => Navigator.of(ctx).pop(true),
-                              child: Text(l.rebuild),
-                            ),
-                          ],
-                        );
-                      },
-                    );
-
-                    if (ok != true) return;
-                    await state.rebuildIndex();
-                    if (!context.mounted) return;
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      SnackBar(content: Text(l.indexRebuilt)),
-                    );
-                  },
-                ),
               ],
             ),
           ),

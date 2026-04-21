@@ -22,6 +22,7 @@ class ClipIndex {
       ValueNotifier((indexed: 0, total: 0, running: false));
 
   static ClipIndex? _instance;
+  Future<int> get indexedCount async => _store.count();
 
   static Future<ClipIndex> instance() async {
     final existing = _instance;
@@ -60,27 +61,33 @@ class ClipIndex {
       return;
     }
 
-    // Prefer the "All"/"Recent" virtual album when available.
     final album = paths.firstWhere(
       (p) => p.isAll,
       orElse: () => paths.first,
     );
+
+    await _startIndexingAlbum(album, pageSize: pageSize);
+  }
+
+  /// ✅ New: index only one folder
+  Future<void> startIndexingFolder(AssetPathEntity folder, {int pageSize = 100}) async {
+    if (progress.value.running) return;
+    progress.value = (indexed: 0, total: 0, running: true);
+    await _startIndexingAlbum(folder, pageSize: pageSize);
+  }
+
+  Future<void> _startIndexingAlbum(AssetPathEntity album, {int pageSize = 100}) async {
     final total = await album.assetCountAsync;
 
-    // Progress should move even if items are skipped/already indexed.
-    // We'll track both processed items and stored embeddings.
     var processed = 0;
     var stored = await _store.count();
     progress.value = (indexed: processed, total: total, running: true);
 
-    // Avoid a per-asset "already indexed" DB query; load once.
     final existingIds = await _store.loadAllAssetIds();
-
     final pages = (total / pageSize).ceil();
 
     var logged = 0;
 
-    // Batch DB writes for speed.
     final pending = <({String assetId, int dim, Uint8List embeddingBytes})>[];
     const batchSize = 25;
     const progressEvery = 5;
@@ -108,7 +115,6 @@ class ClipIndex {
             }
           }
         } catch (e, st) {
-          // Log a few failures so we can diagnose device-specific issues.
           if (logged < 5) {
             logged++;
             debugPrint('Indexing error for asset ${asset.id}: $e');
@@ -136,8 +142,6 @@ class ClipIndex {
     final assetId = asset.id;
     if (existingIds.contains(assetId)) return null;
 
-    // Ensure we get a JPEG/PNG-like encoded thumbnail bytes that Dart can decode.
-    // Some devices store originals as HEIC; forcing JPEG thumbnails avoids decode failures.
     final inputShape = _model.imageInputShape;
     if (inputShape.length != 4) {
       throw StateError('Unexpected image input shape: $inputShape');
@@ -155,22 +159,22 @@ class ClipIndex {
           quality: 90,
         ),
       );
-    } catch (_) {
-      // Fall back below.
-    }
+    } catch (_) {}
 
     encoded ??= await asset.thumbnailDataWithSize(
       ThumbnailSize(w, h),
       quality: 95,
     );
 
-    // Last resort: try original bytes (may still be unsupported formats).
     encoded ??= await asset.originBytes;
 
     if (encoded == null) return null;
 
     final input = preprocessImageToFloat32(encoded, inputShape: inputShape);
-    final emb = l2NormalizeOrNull(_model.runImage(input));
+
+    final tokens = _tokenizer.encodeToContextLength('', contextLength: ClipAssets.contextLength);
+
+    final emb = l2NormalizeOrNull(_model.runImage(input, tokens));
     if (emb == null) return null;
 
     return (
@@ -186,7 +190,6 @@ class ClipIndex {
       throw StateError('Query is empty');
     }
 
-    // CLIP typically performs better with simple prompt templates for single-word queries.
     final isSingleWord = !q.contains(RegExp(r'\s'));
     final prompts = <String>[q];
     if (isSingleWord) {
@@ -204,7 +207,6 @@ class ClipIndex {
       final tokens = _tokenizer.encodeToContextLength(p, contextLength: ClipAssets.contextLength);
       final e = l2NormalizeOrNull(_model.runText(tokens));
       if (e == null) continue;
-      // Accumulate.
       final n = math.min(acc.length, e.length);
       for (var i = 0; i < n; i++) {
         acc[i] += e[i];
@@ -217,9 +219,12 @@ class ClipIndex {
     }
 
     final out = l2NormalizeOrNull(acc);
+    
     if (out == null) {
       throw StateError('Failed to normalize text embedding (unexpected).');
     }
+    debugPrint('QUERY: "$query" first5=${out.sublist(0, 5)} norm=${l2Norm(out).toStringAsFixed(4)}');
+
     return out;
   }
 
@@ -227,24 +232,22 @@ class ClipIndex {
     final textEmb = _encodeTextQuery(query);
 
     final rows = await _store.loadAllEmbeddings();
+    debugPrint('DB count: ${rows.length}');
     if (rows.isEmpty) return const [];
 
     final scored = <({String assetId, double score})>[];
+    scored.removeWhere((e) => e.score < 0.20);
 
     for (final r in rows) {
       if (r.dim != textEmb.length) {
-        // Skip embeddings created by a different model/config.
         continue;
       }
 
       var bytes = r.embedding;
-      // Some platform implementations return a Uint8List view into a larger
-      // buffer with a non-4-byte-aligned offset, which breaks Float32List.view.
       if (bytes.offsetInBytes % Float32List.bytesPerElement != 0) {
         bytes = Uint8List.fromList(bytes);
       }
       if (bytes.lengthInBytes % Float32List.bytesPerElement != 0) {
-        // Corrupt/partial row; skip it rather than crashing search.
         continue;
       }
 
@@ -252,7 +255,7 @@ class ClipIndex {
         bytes.offsetInBytes,
         bytes.lengthInBytes ~/ Float32List.bytesPerElement,
       );
-      // Guard against legacy/non-normalized vectors; normalize on the fly when needed.
+
       Float32List? embNorm;
       final n = l2Norm(emb);
       if (n.isFinite && (n - 1.0).abs() < 0.05) {

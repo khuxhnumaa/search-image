@@ -3,7 +3,6 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 
 import '../clip/clip_index.dart';
-import '../clip/clip_store.dart';
 
 class AppState extends ChangeNotifier {
   ThemeMode _themeMode = ThemeMode.light;
@@ -113,29 +112,17 @@ class AppState extends ChangeNotifier {
     }
   }
 
-  void startIndexingIfNeeded() {
+  // ✅ Only start indexing if DB is empty
+  Future<void> startIndexingIfNeeded() async {
     final idx = _clip;
     if (idx == null) return;
     if (_indexingStarted) return;
+
+    final existingCount = await idx.indexedCount;
+    if (existingCount > 0) return;
+
     _indexingStarted = true;
     unawaited(idx.startIndexingAllImages());
-  }
-
-  Future<void> rebuildIndex() async {
-    // Close existing instance so files can be deleted on device.
-    final idx = _clip;
-    _clip = null;
-    _clipError = null;
-    _indexingStarted = false;
-    notifyListeners();
-
-    if (idx != null) {
-      await idx.close();
-    }
-
-    await ClipStore.deleteDbFile();
-
-    notifyListeners();
   }
 }
 

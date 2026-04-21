@@ -6,9 +6,10 @@ import 'view_image_page.dart';
 import '../widgets/asset_widgets.dart';
 
 class SearchPage extends StatefulWidget {
-  const SearchPage({super.key, required this.index});
+  const SearchPage({super.key, required this.index, this.folder});
 
   final ClipIndex index;
+  final AssetPathEntity? folder;
 
   @override
   State<SearchPage> createState() => _SearchPageState();
@@ -19,10 +20,27 @@ class _SearchPageState extends State<SearchPage> {
   bool _loading = false;
   List<AssetEntity> _results = const [];
 
+  Set<String>? _folderAssetIds;
+
   @override
   void dispose() {
     _controller.dispose();
     super.dispose();
+  }
+
+  Future<Set<String>> _loadFolderAssetIds(AssetPathEntity folder) async {
+    if (_folderAssetIds != null) return _folderAssetIds!;
+    final total = await folder.assetCountAsync;
+    final pages = (total / 200).ceil();
+    final ids = <String>{};
+    for (var page = 0; page < pages; page++) {
+      final items = await folder.getAssetListPaged(page: page, size: 200);
+      for (final a in items) {
+        ids.add(a.id);
+      }
+    }
+    _folderAssetIds = ids;
+    return ids;
   }
 
   Future<void> _runSearch() async {
@@ -34,7 +52,7 @@ class _SearchPageState extends State<SearchPage> {
     });
 
     try {
-      final scored = await widget.index.search(q, k: 60);
+      final scored = await widget.index.search(q, k: 10);
       if (scored.isEmpty) {
         if (!mounted) return;
         ScaffoldMessenger.of(context).showSnackBar(
@@ -45,7 +63,13 @@ class _SearchPageState extends State<SearchPage> {
         });
         return;
       }
-      final ids = scored.map((e) => e.assetId).toList();
+
+      // ✅ If folder is set, filter results to that folder only.
+      List<String> ids = scored.map((e) => e.assetId).toList();
+      if (widget.folder != null) {
+        final allowed = await _loadFolderAssetIds(widget.folder!);
+        ids = ids.where(allowed.contains).toList();
+      }
 
       final ps = await PhotoManager.requestPermissionExtend();
       if (!ps.isAuth) {
@@ -64,9 +88,7 @@ class _SearchPageState extends State<SearchPage> {
         try {
           final ent = await AssetEntity.fromId(id);
           if (ent != null) entities.add(ent);
-        } catch (_) {
-          // Ignore single failures; continue resolving the rest.
-        }
+        } catch (_) {}
       }
 
       if (entities.isEmpty) {

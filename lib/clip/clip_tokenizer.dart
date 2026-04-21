@@ -4,14 +4,8 @@ import 'package:flutter/services.dart' show rootBundle;
 
 import 'clip_assets.dart';
 
-/// Minimal OpenAI CLIP BPE tokenizer implementation in Dart.
-///
-/// Expects assets:
-/// - assets/tokenizer/vocab.json
-/// - assets/tokenizer/merges.txt
-///
-/// If `assets/tokenizer/tokenizer.json` exists, it will be used instead
-/// (HuggingFace tokenizers export containing `model.vocab` + `model.merges`).
+/// MobileCLIP / OpenCLIP-compatible BPE tokenizer.
+/// Uses tokenizer.json (HF) when present and applies byte-level + CLIP regex.
 class ClipTokenizer {
   ClipTokenizer._(
     this._encoder,
@@ -19,6 +13,7 @@ class ClipTokenizer {
     this._byteEncoder,
     this._startToken,
     this._endToken,
+    this._unkToken,
   );
 
   final Map<String, int> _encoder;
@@ -26,6 +21,7 @@ class ClipTokenizer {
   final Map<int, String> _byteEncoder;
   final int _startToken;
   final int _endToken;
+  final int? _unkToken;
 
   static Future<ClipTokenizer> load() async {
     Map<String, int> encoder;
@@ -66,11 +62,16 @@ class ClipTokenizer {
 
     final startToken = encoder['<|startoftext|>'] ?? encoder['<start_of_text>'];
     final endToken = encoder['<|endoftext|>'] ?? encoder['<end_of_text>'];
+    final unkToken = encoder['<unk>'] ?? encoder['[UNK]'];
+
     if (startToken == null || endToken == null) {
-      throw StateError('Tokenizer is missing start/end tokens. Expected <|startoftext|>/<|endoftext|> or <start_of_text>/<end_of_text>.');
+      throw StateError(
+        'Tokenizer is missing start/end tokens. Expected <|startoftext|>/<|endoftext|> '
+        'or <start_of_text>/<end_of_text>.',
+      );
     }
 
-    return ClipTokenizer._(encoder, bpeRanks, byteEncoder, startToken, endToken);
+    return ClipTokenizer._(encoder, bpeRanks, byteEncoder, startToken, endToken, unkToken);
   }
 
   List<int> encodeToContextLength(String text, {int contextLength = ClipAssets.contextLength}) {
@@ -80,7 +81,12 @@ class ClipTokenizer {
     final bpeTokens = _tokenizeToBpeTokens(text);
     for (final t in bpeTokens) {
       final id = _encoder[t];
-      if (id == null) continue;
+      if (id == null) {
+        if (_unkToken != null) {
+          tokens.add(_unkToken!);
+        }
+        continue;
+      }
       tokens.add(id);
       if (tokens.length >= contextLength - 1) break;
     }
@@ -98,11 +104,12 @@ class ClipTokenizer {
   }
 
   List<String> _tokenizeToBpeTokens(String text) {
-    // CLIP-style pre-tokenization.
-    // This is a simplified port of OpenAI CLIP's simple_tokenizer pattern.
-    final cleaned = text.toLowerCase().replaceAll(RegExp(r"\s+"), ' ').trim();
-
+    // MobileCLIP/OpenCLIP uses byte-level BPE with the CLIP regex.
+    var cleaned = text.toLowerCase().replaceAll(RegExp(r"\s+"), ' ').trim();
     if (cleaned.isEmpty) return const [];
+
+    // CLIP/GPT2-style uses a leading space
+    if (!cleaned.startsWith(' ')) cleaned = ' $cleaned';
 
     final words = _clipTokenPattern.allMatches(cleaned).map((m) => m.group(0)!).toList();
     final out = <String>[];
@@ -117,7 +124,7 @@ class ClipTokenizer {
     final bytes = utf8.encode(token);
     final chars = bytes.map((b) => _byteEncoder[b]!).join();
 
-    // OpenAI CLIP appends </w> to the last character to mark end-of-word.
+    // Append </w> to last char
     var word = chars.split('').toList();
     if (word.isNotEmpty) {
       word[word.length - 1] = '${word.last}</w>';
@@ -180,9 +187,10 @@ class ClipTokenizer {
     }
   }
 
-  // Simplified CLIP tokenizer regex (ASCII-focused). This matches common English queries.
+  // CLIP/GPT2 regex (unicode-aware)
   static final RegExp _clipTokenPattern = RegExp(
-    r"'s|'t|'re|'ve|'m|'ll|'d|[A-Za-z]+|[0-9]+|[^\sA-Za-z0-9]+",
+    r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+",
+    unicode: true,
   );
 
   static int _indexOfPair(List<String> word, String a, String b, {int start = 0}) {
@@ -201,11 +209,6 @@ class ClipTokenizer {
   }
 
   static Map<int, String> _bytesToUnicode() {
-    // Matches the byte->unicode mapping used by OpenAI CLIP.
-    //
-    // Source idea: map bytes to a set of unicode chars that are unlikely to occur in text.
-    // Reference ranges:
-    // 33..126, 161..172, 174..255
     final bs = <int>[];
     bs.addAll(List<int>.generate(94, (i) => i + 33));
     bs.addAll(List<int>.generate(12, (i) => i + 161));

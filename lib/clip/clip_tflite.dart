@@ -1,96 +1,141 @@
 import 'dart:typed_data';
 
+import 'package:flutter/foundation.dart';
 import 'package:tflite_flutter/tflite_flutter.dart';
 
 import 'clip_assets.dart';
 
 class ClipTflite {
-  ClipTflite._(this._imageInterpreter, this._textInterpreter);
+  ClipTflite._(
+    this._interpreter,
+    this._imageInputIndex,
+    this._textInputIndex,
+    this._imageOutputIndex,
+    this._textOutputIndex,
+  );
 
-  final Interpreter _imageInterpreter;
-  final Interpreter _textInterpreter;
+  final Interpreter _interpreter;
+  final int _imageInputIndex;
+  final int _textInputIndex;
+  final int _imageOutputIndex;
+  final int _textOutputIndex;
 
-  bool _imageAllocated = false;
-  bool _textAllocated = false;
+  bool _allocated = false;
 
-  List<int> get imageInputShape => _imageInterpreter.getInputTensor(0).shape;
+  List<int> get imageInputShape => _interpreter.getInputTensor(_imageInputIndex).shape;
 
   static Future<ClipTflite> load() async {
     final options = InterpreterOptions()..threads = 2;
+    final interpreter = await Interpreter.fromAsset(
+      ClipAssets.imageEncoderModel, // combined model
+      options: options,
+    );
 
-    final imageInterpreter = await Interpreter.fromAsset(ClipAssets.imageEncoderModel, options: options);
-    final textInterpreter = await Interpreter.fromAsset(ClipAssets.textEncoderModel, options: options);
+    debugPrint('INPUT TENSORS: ${interpreter.getInputTensors().map((t) => t.shape).toList()}');
+    debugPrint('OUTPUT TENSORS: ${interpreter.getOutputTensors().map((t) => t.shape).toList()}');
 
-    // Ensure image encoder input is a concrete 4D shape and allocate tensors.
-    // If allocation fails here, we must NOT continue; otherwise later `run()`
-    // commonly throws the native `Bad state: failed precondition`.
-    try {
-      final s = imageInterpreter.getInputTensor(0).shape;
+    final inputs = interpreter.getInputTensors();
 
-      bool needsResize = s.length != 4;
-      if (!needsResize) {
-        final has3 = (s.length == 4) && (s[1] == 3 || s[3] == 3);
-        needsResize = !has3;
+    int? imageIdx;
+    int? textIdx;
+
+    for (var i = 0; i < inputs.length; i++) {
+      final s = inputs[i].shape;
+      if (s.length == 4 && (s[1] == 3 || s[3] == 3)) {
+        imageIdx = i;
+      } else if ((s.length == 2 && s[1] == ClipAssets.contextLength) ||
+          (s.length == 1 && s[0] == ClipAssets.contextLength)) {
+        textIdx = i;
       }
-
-      if (needsResize) {
-        // Try NCHW first (common for PyTorch exports), then NHWC.
-        try {
-          imageInterpreter.resizeInputTensor(0, [1, 3, ClipAssets.imageSize, ClipAssets.imageSize]);
-          imageInterpreter.allocateTensors();
-        } catch (_) {
-          imageInterpreter.resizeInputTensor(0, [1, ClipAssets.imageSize, ClipAssets.imageSize, 3]);
-          imageInterpreter.allocateTensors();
-        }
-      } else {
-        imageInterpreter.allocateTensors();
-      }
-    } catch (e) {
-      imageInterpreter.close();
-      textInterpreter.close();
-      rethrow;
     }
 
-    // Ensure text encoder input shape matches our context length.
-    try {
-      final inputTensors = textInterpreter.getInputTensors();
-      if (inputTensors.isEmpty) {
-        throw StateError('Text encoder has no input tensors.');
-      }
+    if (imageIdx == null || textIdx == null) {
+      interpreter.close();
+      throw StateError('Unable to identify image/text inputs. Shapes: ${inputs.map((t) => t.shape).toList()}');
+    }
 
-      final t0 = inputTensors[0].shape;
-      if (t0.length == 2 && t0[0] == 1 && t0[1] != ClipAssets.contextLength) {
-        textInterpreter.resizeInputTensor(0, [1, ClipAssets.contextLength]);
-      } else if (t0.length == 1 && t0[0] != ClipAssets.contextLength) {
-        textInterpreter.resizeInputTensor(0, [ClipAssets.contextLength]);
-      } else if (t0.length != 1 && t0.length != 2) {
-        throw StateError('Unexpected text input shape: $t0');
-      }
+    interpreter.allocateTensors();
 
-      if (inputTensors.length >= 2) {
-        final t1 = inputTensors[1].shape;
-        if (t1.length == 2 && t1[0] == 1 && t1[1] != ClipAssets.contextLength) {
-          textInterpreter.resizeInputTensor(1, [1, ClipAssets.contextLength]);
-        } else if (t1.length == 1 && t1[0] != ClipAssets.contextLength) {
-          textInterpreter.resizeInputTensor(1, [ClipAssets.contextLength]);
+    int detectTextOutputIndex({
+      required Interpreter interpreter,
+      required int imageIdx,
+      required int textIdx,
+    }) {
+      final imageShape = interpreter.getInputTensor(imageIdx).shape;
+      final imageLen = imageShape.reduce((a, b) => a * b);
+      final imageBytes = Float32List(imageLen).buffer.asUint8List();
+
+      final textShape = interpreter.getInputTensor(textIdx).shape;
+      final textLen = textShape.length == 2 ? textShape[1] : textShape[0];
+
+      final tokensA = List<int>.filled(textLen, 0);
+      final tokensB = List<int>.filled(textLen, 1);
+
+      Uint8List pack(List<int> values) {
+        switch (interpreter.getInputTensor(textIdx).type) {
+          case TensorType.int32:
+            return Int32List.fromList(values).buffer.asUint8List();
+          case TensorType.int64:
+            return Int64List.fromList(values).buffer.asUint8List();
+          case TensorType.float32:
+            return Float32List.fromList(values.map((e) => e.toDouble()).toList())
+                .buffer
+                .asUint8List();
+          default:
+            throw StateError('Unsupported text input type');
         }
       }
 
-      textInterpreter.allocateTensors();
-    } catch (e) {
-      imageInterpreter.close();
-      textInterpreter.close();
-      rethrow;
+      Map<int, Object> allocOutputs() {
+        final out = <int, Object>{};
+        final outs = interpreter.getOutputTensors();
+        for (var i = 0; i < outs.length; i++) {
+          out[i] = _allocOutputForShape(outs[i].shape);
+        }
+        return out;
+      }
+
+      final outA = allocOutputs();
+      interpreter.runForMultipleInputs([imageBytes, pack(tokensA)], outA);
+
+      final outB = allocOutputs();
+      interpreter.runForMultipleInputs([imageBytes, pack(tokensB)], outB);
+
+      double diffFor(int i) {
+        final a = _flattenFloatOutput(outA[i]!, interpreter.getOutputTensor(i).shape);
+        final b = _flattenFloatOutput(outB[i]!, interpreter.getOutputTensor(i).shape);
+        var sum = 0.0;
+        for (var k = 0; k < a.length; k++) {
+          final d = a[k] - b[k];
+          sum += d * d;
+        }
+        return sum;
+      }
+
+      var bestIdx = 0;
+      var bestDiff = -1.0;
+      for (var i = 0; i < interpreter.getOutputTensors().length; i++) {
+        final d = diffFor(i);
+        if (d > bestDiff) {
+          bestDiff = d;
+          bestIdx = i;
+        }
+      }
+      return bestIdx;
     }
 
-    final m = ClipTflite._(imageInterpreter, textInterpreter);
-    m._imageAllocated = true;
-    m._textAllocated = true;
-    return m;
+    final textOut = detectTextOutputIndex(
+      interpreter: interpreter,
+      imageIdx: imageIdx,
+      textIdx: textIdx,
+    );
+    final imageOut = (textOut == 0) ? 1 : 0;
+
+    return ClipTflite._(interpreter, imageIdx, textIdx, imageOut, textOut);
   }
 
   int get imageEmbeddingDim {
-    final out = _imageInterpreter.getOutputTensor(0);
+    final out = _interpreter.getOutputTensor(_imageOutputIndex);
     final shape = out.shape;
     if (shape.length == 2 && shape[0] == 1) return shape[1];
     if (shape.length == 1) return shape[0];
@@ -98,110 +143,91 @@ class ClipTflite {
   }
 
   int get textEmbeddingDim {
-    final out = _textInterpreter.getOutputTensor(0);
+    final out = _interpreter.getOutputTensor(_textOutputIndex);
     final shape = out.shape;
     if (shape.length == 2 && shape[0] == 1) return shape[1];
     if (shape.length == 1) return shape[0];
     throw StateError('Unexpected text encoder output shape: $shape');
   }
 
-  /// Expects a flattened float32 tensor matching the model input.
-  Float32List runImage(Float32List input) {
-    if (!_imageAllocated) {
-      _imageInterpreter.allocateTensors();
-      _imageAllocated = true;
-    }
-    final inputTensor = _imageInterpreter.getInputTensor(0);
-    final inputShape = inputTensor.shape;
-    final expected = inputShape.reduce((a, b) => a * b);
-    if (input.length != expected) {
-      throw StateError('Image input length ${input.length} does not match expected $expected for shape $inputShape');
+  Float32List runImage(Float32List input, List<int> tokens) {
+    if (!_allocated) {
+      _interpreter.allocateTensors();
+      _allocated = true;
     }
 
-    final outTensor = _imageInterpreter.getOutputTensor(0);
-    final outShape = outTensor.shape;
+    final imageBytes = input.buffer.asUint8List(input.offsetInBytes, input.lengthInBytes);
+    final textBytes = _packInts(tokens, _interpreter.getInputTensor(_textInputIndex).type);
 
-    final output = _allocFloatOutput(outShape);
-    // IMPORTANT: pass raw bytes so tflite_flutter does NOT try to infer/resize
-    // the input tensor shape from a 1D Dart List (which would break fixed-rank models).
-    final inputBytes = input.buffer.asUint8List(input.offsetInBytes, input.lengthInBytes);
-    _imageInterpreter.run(inputBytes, output);
+    final outputs = <int, Object>{};
+    final outTensors = _interpreter.getOutputTensors();
+    for (var i = 0; i < outTensors.length; i++) {
+      outputs[i] = _allocOutputForShape(outTensors[i].shape);
+    }
 
-    final outputFlat = _flattenFloatOutput(output, outShape);
+    _interpreter.runForMultipleInputs([imageBytes, textBytes], outputs);
 
-    // Normalize to [D]
+    final outputFlat = _flattenFloatOutput(
+      outputs[_imageOutputIndex]!,
+      _interpreter.getOutputTensor(_imageOutputIndex).shape,
+    );
+
     final d = imageEmbeddingDim;
     if (outputFlat.length == d) return outputFlat;
     return Float32List.fromList(outputFlat.sublist(0, d));
   }
 
-  /// Expects token ids shaped `[contextLength]` flattened.
   Float32List runText(List<int> tokens) {
-    if (!_textAllocated) {
-      _textInterpreter.allocateTensors();
-      _textAllocated = true;
-    }
-    final inputTensors = _textInterpreter.getInputTensors();
-    if (inputTensors.isEmpty) {
-      throw StateError('Text encoder has no input tensors.');
+    if (!_allocated) {
+      _interpreter.allocateTensors();
+      _allocated = true;
     }
 
-    final shape = inputTensors[0].shape;
+    final imageInput = _interpreter.getInputTensor(_imageInputIndex);
+    final imageLen = imageInput.shape.reduce((a, b) => a * b);
+    final imageBytes = Float32List(imageLen).buffer.asUint8List();
 
-    // Accept either [1, T] or [T].
-    int expected;
-    if (shape.length == 2 && shape[0] == 1) {
-      expected = shape[1];
-    } else if (shape.length == 1) {
-      expected = shape[0];
-    } else {
-      throw StateError('Unexpected text input shape: $shape');
+    final textBytes = _packInts(tokens, _interpreter.getInputTensor(_textInputIndex).type);
+
+    final outputs = <int, Object>{};
+    final outTensors = _interpreter.getOutputTensors();
+    for (var i = 0; i < outTensors.length; i++) {
+      outputs[i] = _allocOutputForShape(outTensors[i].shape);
     }
 
-    if (tokens.length != expected) {
-      throw StateError('Token length ${tokens.length} does not match expected $expected for shape $shape');
-    }
+    _interpreter.runForMultipleInputs([imageBytes, textBytes], outputs);
 
-    Uint8List packInts(List<int> values, TensorType type) {
-      switch (type) {
-        case TensorType.int32:
-          final a = Int32List.fromList(values);
-          return a.buffer.asUint8List(a.offsetInBytes, a.lengthInBytes);
-        case TensorType.int64:
-          final a = Int64List.fromList(values);
-          return a.buffer.asUint8List(a.offsetInBytes, a.lengthInBytes);
-        case TensorType.float32:
-          final a = Float32List.fromList(values.map((e) => e.toDouble()).toList());
-          return a.buffer.asUint8List(a.offsetInBytes, a.lengthInBytes);
-        default:
-          throw StateError('Unsupported text input tensor type: $type');
-      }
-    }
-
-    final outTensor = _textInterpreter.getOutputTensor(0);
-    final outShape = outTensor.shape;
-    final output = _allocFloatOutput(outShape);
-
-    final input0Bytes = packInts(tokens, inputTensors[0].type);
-
-    if (inputTensors.length >= 2) {
-      // Common pattern: [input_ids, attention_mask]
-      final attentionMask = List<int>.filled(tokens.length, 1);
-      for (var i = 0; i < attentionMask.length; i++) {
-        attentionMask[i] = tokens[i] == 0 ? 0 : 1;
-      }
-
-      final input1Bytes = packInts(attentionMask, inputTensors[1].type);
-      _textInterpreter.runForMultipleInputs([input0Bytes, input1Bytes], {0: output});
-    } else {
-      _textInterpreter.run(input0Bytes, output);
-    }
-
-    final outputFlat = _flattenFloatOutput(output, outShape);
+    final outputFlat = _flattenFloatOutput(
+      outputs[_textOutputIndex]!,
+      _interpreter.getOutputTensor(_textOutputIndex).shape,
+    );
 
     final d = textEmbeddingDim;
     if (outputFlat.length == d) return outputFlat;
     return Float32List.fromList(outputFlat.sublist(0, d));
+  }
+
+  static Uint8List _packInts(List<int> values, TensorType type) {
+    switch (type) {
+      case TensorType.int32:
+        final a = Int32List.fromList(values);
+        return a.buffer.asUint8List(a.offsetInBytes, a.lengthInBytes);
+      case TensorType.int64:
+        final a = Int64List.fromList(values);
+        return a.buffer.asUint8List(a.offsetInBytes, a.lengthInBytes);
+      case TensorType.float32:
+        final a = Float32List.fromList(values.map((e) => e.toDouble()).toList());
+        return a.buffer.asUint8List(a.offsetInBytes, a.lengthInBytes);
+      default:
+        throw StateError('Unsupported text input tensor type: $type');
+    }
+  }
+
+  static Object _allocOutputForShape(List<int> shape) {
+    if (shape.isEmpty) {
+      return Float32List(1); // scalar output
+    }
+    return _allocFloatOutput(shape);
   }
 
   static Object _allocFloatOutput(List<int> shape) {
@@ -209,8 +235,6 @@ class ClipTflite {
       return Float32List(shape[0]);
     }
     if (shape.length == 2) {
-      // tflite_flutter commonly expects nested Dart Lists for multi-dim outputs.
-      // Some delegates also return List<double> even if we allocate typed lists.
       return List.generate(shape[0], (_) => List<double>.filled(shape[1], 0.0));
     }
     throw StateError('Unsupported output shape: $shape');
@@ -219,16 +243,12 @@ class ClipTflite {
   static Float32List _flattenFloatOutput(Object output, List<int> shape) {
     final expectedLen = shape.reduce((a, b) => a * b);
 
-    // Fast paths.
     if (output is Float32List) return output;
     if (output is List<double>) return Float32List.fromList(output);
 
     if (shape.length == 1) {
       if (output is List) {
         final flat = Float32List(expectedLen);
-        if (output.length != expectedLen) {
-          throw StateError('Unexpected 1D output length ${output.length} for shape $shape');
-        }
         for (var i = 0; i < expectedLen; i++) {
           flat[i] = (output[i] as num).toDouble();
         }
@@ -242,32 +262,11 @@ class ClipTflite {
         final flat = Float32List(expectedLen);
         var k = 0;
         for (final row in output) {
-          if (row is Float32List) {
-            for (var j = 0; j < row.length; j++) {
-              if (k >= expectedLen) break;
-              flat[k++] = row[j];
-            }
-            continue;
-          }
-
           if (row is List) {
             for (final v in row) {
-              if (k >= expectedLen) break;
               flat[k++] = (v as num).toDouble();
             }
-            continue;
           }
-
-          if (row is num) {
-            if (k < expectedLen) flat[k++] = row.toDouble();
-            continue;
-          }
-
-          throw StateError('Unsupported 2D row type ${row.runtimeType} for shape $shape');
-        }
-
-        if (k != expectedLen) {
-          throw StateError('Unexpected flattened output length $k for shape $shape');
         }
         return flat;
       }
@@ -278,7 +277,6 @@ class ClipTflite {
   }
 
   void close() {
-    _imageInterpreter.close();
-    _textInterpreter.close();
+    _interpreter.close();
   }
 }

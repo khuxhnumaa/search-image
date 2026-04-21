@@ -36,7 +36,6 @@ class _GalleryPageState extends State<GalleryPage> {
     try {
       ps = await PhotoManager.requestPermissionExtend();
     } catch (_) {
-      // In unit/widget tests there is no platform implementation.
       if (!mounted) return;
       setState(() {
         _loading = false;
@@ -76,9 +75,7 @@ class _GalleryPageState extends State<GalleryPage> {
       _index = await ClipIndex.instance();
       _indexError = null;
 
-      // Fire-and-forget indexing in background.
-      // This is intentionally minimal: indexing may take time for large galleries.
-      unawaited(_index!.startIndexingAllImages());
+      // ✅ Removed: no auto indexing here (folder indexing happens on folder page)
     } catch (e) {
       _index = null;
       _indexError = e.toString();
